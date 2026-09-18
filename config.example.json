@@ -1,0 +1,64 @@
+{
+  "model": {
+    "dim": 384,
+    "num_layers": 8,
+    "max_len": 256,
+    "k": 6
+  },
+  "data": {
+    "type": "hf",
+    "path": "",
+    "hf_name": "HuggingFaceFW/fineweb-edu",
+    "hf_config": "sample-10BT",
+    "max_articles": 130000,
+    "hf_split": "train",
+    "hf_revision": "",
+    "text_column": "text",
+    "data_dir": "./data",
+    "tokenizer_vocab_size": 32768,
+    "val_fraction": 0.01,
+    "append_eot": true,
+    "seed": 1337
+  },
+  "training": {
+    "batch_size": 16,
+    "steps": 25000,
+    "lr": 0.00025,
+    "min_lr": 2e-05,
+    "warmup_steps": 250,
+    "weight_decay": 0.0001,
+    "stage_size": 4,
+    "grad_clip": 1.0,
+    "log_interval": 50,
+    "eval_interval": 0,
+    "checkpoint_interval": 1000,
+    "sample_interval": 1000,
+    "eval_batches": 20,
+    "seed": 1337,
+    "compile": false,
+    "compile_mode": "default",
+    "prefetch": true,
+    "prefetch_depth": 2,
+    "prefetch_pin": true,
+    "ema_decay": 0.9999,
+    "ema_interval": 8,
+    "ema_device": "cuda"
+  },
+  "generation": {
+    "max_new_tokens": 70,
+    "temperature": 0.68,
+    "top_k": 40,
+    "top_p": 0.9,
+    "repetition_penalty": 1.2,
+    "prompts": [
+      "Photosynthesis is the process by which",
+      "The solar system consists of",
+      "In computer science, algorithms are"
+    ]
+  },
+  "io": {
+    "checkpoint_dir": "./checkpoints",
+    "checkpoint_name": "kan_model",
+    "config_path": "config.json"
+  }
+}
