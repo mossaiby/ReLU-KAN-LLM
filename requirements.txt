@@ -1,15 +1,12 @@
 # PyTorch CUDA 12.1 build
-#
-# IMPORTANT:
-# The +cu121 suffix is intentional. It prevents pip from selecting
-# the CPU build from PyPI.
-
+# The +cu121 suffix and extra-index-url prevent pip from selecting the CPU build.
 --extra-index-url https://download.pytorch.org/whl/cu121
 
 torch==2.5.1+cu121
 
-numpy>=1.26.0
+numpy>=1.26.0,<2.0.0
 tokenizers>=0.19.0
 datasets>=2.19.0
 huggingface_hub>=0.23.0
 pyarrow>=15.0.0
+setuptools>=68.0.0
