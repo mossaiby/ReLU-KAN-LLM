@@ -3,18 +3,18 @@
 # Generalized decoupled KAN-LLM trainer.
 #
 # Throughput-first defaults:
-#   * torch.compile off (enable with --compile).
+#   * torch.compile supported with clean graph execution (enable with --compile).
 #   * periodic eval off (set --eval-interval N to re-enable).
-#   * background prefetcher off (set --prefetch).
+#   * background prefetcher on by default (set --no-prefetch to disable).
 #   * no per-log torch.cuda.synchronize(); throughput is windowed + cumulative.
 #   * logits fed to F.cross_entropy in autocast dtype.
-#   * best.pt is only written at checkpoint boundaries or val improvement.
+#   * best.pt atomically stores smoothed EMA weights upon improvement.
 #   * checkpoints are written atomically with retries.
-#   * Lightweight EMA: tracks only active trainable parameters and updates
-#     on an 8-step compound cadence using batched multi-tensor kernels.
+#   * Lightweight EMA: tracks active trainable parameters, updates on an
+#     8-step compound cadence using batched multi-tensor kernels, with fast in-VRAM swaps.
 #   * Unused local heads are pruned from intermediate blocks, freeing >300 MB
 #     of VRAM and optimizer state on 4 GB laptop GPUs.
-#   * --save-config CLI switch writes all effective options back to config.json.
+#   * Immediate post-step gradient zeroing minimizes peak stage activation memory.
 
 import os
 import sys
@@ -47,20 +47,20 @@ DEFAULT_CONFIG = {
         "dim": 384,
         "num_layers": 8,
         "max_len": 256,
-        "k": 4
+        "k": 6
     },
     "data": {
         "type": "hf",
         "path": "",
-        "hf_name": "codelion/fineweb-edu-100M",
-        "hf_config": "",
+        "hf_name": "HuggingFaceFW/fineweb-edu",
+        "hf_config": "sample-10BT",
         "hf_split": "train",
         "hf_revision": "",
         "text_column": "text",
         "data_dir": "./data",
         "tokenizer_vocab_size": 32768,
         "val_fraction": 0.01,
-        "max_articles": 0,
+        "max_articles": 130000,
         "append_eot": True,
         "seed": 1337
     },
@@ -69,7 +69,7 @@ DEFAULT_CONFIG = {
         "steps": 25000,
         "lr": 2.5e-4,
         "min_lr": 2e-5,
-        "warmup_steps": 100,
+        "warmup_steps": 250,
         "weight_decay": 1e-4,
         "stage_size": 4,
         "grad_clip": 1.0,
@@ -81,9 +81,9 @@ DEFAULT_CONFIG = {
         "seed": 1337,
         "compile": False,
         "compile_mode": "default",
-        "prefetch": False,
+        "prefetch": True,
         "prefetch_depth": 2,
-        "prefetch_pin": False,
+        "prefetch_pin": True,
         "ema_decay": 0.9999,
         "ema_interval": 8,
         "ema_device": "cuda"
@@ -135,12 +135,15 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--min-lr", type=float, default=None)
     p.add_argument("--warmup-steps", type=int, default=None)
+    p.add_argument("--weight-decay", type=float, default=None)
+    p.add_argument("--grad-clip", type=float, default=None)
     p.add_argument("--stage-size", type=int, default=None)
     p.add_argument("--ema-decay", type=float, default=None)
     p.add_argument("--ema-interval", type=int, default=None)
     p.add_argument("--ema-device", type=str, choices=["cuda", "cpu"], default=None)
     p.add_argument("--eval-interval", type=int, default=None,
                    help="Steps between validation evals. 0 = disabled (default).")
+    p.add_argument("--eval-batches", type=int, default=None)
     p.add_argument("--checkpoint-interval", type=int, default=None)
     p.add_argument("--sample-interval", type=int, default=None)
     p.add_argument("--data-type", type=str, choices=["text", "hf"], default=None)
@@ -182,11 +185,14 @@ def load_config():
         "batch_size": ("training", "batch_size"), "steps": ("training", "steps"),
         "lr": ("training", "lr"), "min_lr": ("training", "min_lr"),
         "warmup_steps": ("training", "warmup_steps"),
+        "weight_decay": ("training", "weight_decay"),
+        "grad_clip": ("training", "grad_clip"),
         "stage_size": ("training", "stage_size"),
         "ema_decay": ("training", "ema_decay"),
         "ema_interval": ("training", "ema_interval"),
         "ema_device": ("training", "ema_device"),
         "eval_interval": ("training", "eval_interval"),
+        "eval_batches": ("training", "eval_batches"),
         "checkpoint_interval": ("training", "checkpoint_interval"),
         "sample_interval": ("training", "sample_interval"),
         "data_type": ("data", "type"), "data_path": ("data", "path"),
@@ -245,6 +251,10 @@ def validate_config(cfg):
         raise ValueError("data.tokenizer_vocab_size must be >= 2.")
     if not 0.0 <= float(d["val_fraction"]) < 1.0:
         raise ValueError("data.val_fraction must be in [0, 1).")
+    if d["type"] not in ("text", "hf"):
+        raise ValueError("data.type must be 'text' or 'hf'.")
+    if d["type"] == "text" and (not d["path"] or not Path(d["path"]).is_file()):
+        raise ValueError(f"data.path must be a valid file when data.type is 'text' (got: {d['path']!r}).")
     if t["batch_size"] < 1 or t["steps"] < 1:
         raise ValueError("training.batch_size and training.steps must be >= 1.")
     if t["stage_size"] < 1:
@@ -259,8 +269,8 @@ def validate_config(cfg):
         raise ValueError("training.eval_interval must be >= 0 (0 = disabled).")
     if int(t.get("prefetch_depth", 2)) < 1:
         raise ValueError("training.prefetch_depth must be >= 1.")
-    if float(t.get("ema_decay", 0.0)) >= 1.0:
-        raise ValueError("training.ema_decay must be < 1.0 (0 disables EMA).")
+    if not 0.0 <= float(t.get("ema_decay", 0.0)) < 1.0:
+        raise ValueError("training.ema_decay must be in [0.0, 1.0) (0 disables EMA).")
     if int(t.get("ema_interval", 8)) < 1:
         raise ValueError("training.ema_interval must be >= 1.")
 
@@ -396,11 +406,14 @@ def check_free_disk_space(path, required_mb=3500):
 def build_compiled_forward_parts(model, batch_size, seq_len, device, compile_mode, stage_size):
     opts = dict(mode=compile_mode, dynamic=False, fullgraph=False)
     cand_blocks = [torch.compile(b, **opts) for b in model.blocks]
-    cand_heads = [torch.compile(b.local_head, **opts) for b in model.blocks]
+    cand_heads = [
+        torch.compile(b.local_head, **opts) if not isinstance(b.local_head, nn.Identity) else b.local_head
+        for b in model.blocks
+    ]
 
     amp_dtype = resolve_amp_dtype(device)
     dummy_x = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
-    dummy_y = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+    dummy_y = torch.zeros(batch_size * seq_len, dtype=torch.long, device=device)
 
     num_stages = math.ceil(len(model.blocks) / stage_size)
     h = model.get_initial_embeddings(dummy_x)
@@ -413,7 +426,7 @@ def build_compiled_forward_parts(model, batch_size, seq_len, device, compile_mod
             for l in range(start, end):
                 h = cand_blocks[l](h)
             logits = cand_heads[end - 1](h)
-            warm_loss = F.cross_entropy(logits.view(-1, model.vocab_size), dummy_y.reshape(-1))
+            warm_loss = F.cross_entropy(logits.view(-1, model.vocab_size), dummy_y)
         warm_loss.backward()
 
     model.zero_grad(set_to_none=True)
@@ -503,7 +516,7 @@ _CLEAN_RE = re.compile(r"\n{3,}")
 
 
 def clean_document(text):
-    if not text:
+    if not isinstance(text, str):
         return None
     t = _CLEAN_RE.sub("\n\n", text.strip())
     return t if len(t) >= 120 else None
@@ -513,10 +526,9 @@ def compute_data_signature(cfg):
     d = cfg["data"]
     if d["type"] == "text":
         p = Path(d["path"])
-        try:
-            st = p.stat()
-        except FileNotFoundError:
+        if not p.is_file():
             raise FileNotFoundError(f"Data file not found: {p}")
+        st = p.stat()
         ident = f"text:{p.resolve()}:{st.st_size}:{int(st.st_mtime)}"
     else:
         ident = f"hf:{d['hf_name']}:{d.get('hf_config') or ''}:{d['hf_split']}:{d.get('hf_revision') or ''}"
@@ -533,7 +545,7 @@ def load_documents(cfg):
     docs = []
     if d["type"] == "text":
         p = Path(d["path"])
-        if not p.exists():
+        if not p.is_file():
             raise FileNotFoundError(f"Data file not found: {p}")
         print(f"[data] Reading local text file {p} ...")
         raw = p.read_text(encoding="utf-8", errors="replace")
@@ -605,16 +617,17 @@ def tokenize_and_cache(cfg, documents, tokenizer, signature):
 
     tokens = torch.tensor(all_tokens, dtype=torch.int32)
     n_val = int(len(tokens) * float(d["val_fraction"]))
+    min_required = cfg["model"]["max_len"] + 1
     n_val = min(n_val, len(tokens) // 10)
-    if n_val > 0:
+    if n_val >= min_required:
         val = tokens[:n_val]
         train = tokens[n_val:]
     else:
         val = tokens
         train = tokens
 
-    if len(train) <= 1:
-        raise RuntimeError(f"Not enough training tokens ({len(train):,}).")
+    if len(train) <= min_required:
+        raise RuntimeError(f"Not enough training tokens ({len(train):,} vs required {min_required:,}).")
     Path(d["data_dir"]).mkdir(parents=True, exist_ok=True)
     torch.save({"data_signature": signature, "train": train, "val": val}, cache_path)
     print(f"[data] Tokenized {len(tokens):,} tokens in {time.time()-t0:.1f}s -> {cache_path}")
@@ -667,7 +680,7 @@ def get_batch(data, batch_size, seq_len, device, generator=None):
 
 
 # ---------------------------------------------------------------------------
-# Optional prefetcher (off by default)
+# Optional prefetcher
 # ---------------------------------------------------------------------------
 
 class PrefetchLoader:
@@ -681,6 +694,7 @@ class PrefetchLoader:
         self.gen = torch.Generator()
         if seed is not None:
             self.gen.manual_seed(seed)
+        self._gen_lock = threading.Lock()
 
         self._q = queue.Queue(maxsize=depth)
         self._stop = threading.Event()
@@ -696,7 +710,8 @@ class PrefetchLoader:
                 f"Dataset has {len(self.data):,} tokens, but seq_len={self.seq_len} "
                 f"requires at least {self.seq_len + 1:,} tokens."
             )
-        starts = torch.randint(window_count, (self.batch_size,), generator=self.gen)
+        with self._gen_lock:
+            starts = torch.randint(window_count, (self.batch_size,), generator=self.gen)
         seq = self.data.unfold(0, self.seq_len + 1, 1).index_select(0, starts)
         if self.pin:
             seq = seq.pin_memory()
@@ -729,8 +744,10 @@ class PrefetchLoader:
     def get(self):
         self._ensure_started()
         item = self._q.get()
-        if item is None and self._err is not None:
-            raise self._err
+        if item is None:
+            if self._err is not None:
+                raise self._err
+            raise RuntimeError("PrefetchLoader queue was closed or returned None.")
         if self.device.type == "cuda":
             seq_dev = item.to(self.device, non_blocking=self.pin).long()
         else:
@@ -738,10 +755,14 @@ class PrefetchLoader:
         return seq_dev[:, :-1], seq_dev[:, 1:]
 
     def get_state(self):
-        return self.gen.get_state()
+        with self._gen_lock:
+            return self.gen.get_state()
 
     def set_state(self, state):
-        self.gen.set_state(state)
+        with self._gen_lock:
+            if isinstance(state, torch.Tensor):
+                state = state.detach().to(device="cpu", dtype=torch.uint8)
+            self.gen.set_state(state)
 
     def close(self):
         if not self._started:
@@ -769,35 +790,29 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_len=1024):
         super().__init__()
         self.dim = dim
-        self._cast_cache = {}
+        self.max_len = max_len
         self._build_tables(max_len)
 
-    def _build_tables(self, max_len, device=None):
+    def _build_tables(self, max_len, device=None, dtype=torch.float32):
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim))
         t = torch.arange(max_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        self.register_buffer("cos2", torch.cat([cos, cos], dim=-1), persistent=False)
-        self.register_buffer("sin2", torch.cat([sin, sin], dim=-1), persistent=False)
-        self._cast_cache.clear()
-
-    def _tables(self, T, dtype, device):
-        if T > self.cos2.shape[0]:
-            self._build_tables(max(T, self.cos2.shape[0] * 2), device=device)
-        key = (T, dtype, device)
-        hit = self._cast_cache.get(key)
-        if hit is None:
-            hit = (
-                self.cos2[:T].to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(0),
-                self.sin2[:T].to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(0),
-            )
-            if len(self._cast_cache) > 8:
-                self._cast_cache.clear()
-            self._cast_cache[key] = hit
-        return hit
+        cos2 = torch.cat([cos, cos], dim=-1).view(1, 1, max_len, self.dim).to(dtype=dtype)
+        sin2 = torch.cat([sin, sin], dim=-1).view(1, 1, max_len, self.dim).to(dtype=dtype)
+        self.register_buffer("cos2", cos2, persistent=False)
+        self.register_buffer("sin2", sin2, persistent=False)
 
     def forward(self, q, k):
-        cos, sin = self._tables(q.shape[2], q.dtype, q.device)
+        T = q.shape[2]
+        if T > self.cos2.shape[2]:
+            self._build_tables(max(T, self.cos2.shape[2] * 2), device=q.device, dtype=q.dtype)
+        elif self.cos2.device != q.device or self.cos2.dtype != q.dtype:
+            self.cos2 = self.cos2.to(device=q.device, dtype=q.dtype)
+            self.sin2 = self.sin2.to(device=q.device, dtype=q.dtype)
+
+        cos = self.cos2[:, :, :T]
+        sin = self.sin2[:, :, :T]
         q_rot = q * cos + _rotate_half(q) * sin
         k_rot = k * cos + _rotate_half(k) * sin
         return q_rot, k_rot
@@ -836,14 +851,12 @@ class ReLUKANLinear(nn.Module):
         self.register_buffer("grid", grid.view(1, 1, 1, k))
         std = 1.0 / math.sqrt(in_features * k)
         self.kan_weight = nn.Parameter(torch.randn(out_features, in_features * k) * std)
-        self._cached_grid = None
 
     def forward(self, x):
         base_out = self.base_linear(F.silu(x))
-        if self._cached_grid is None or self._cached_grid.dtype != x.dtype or self._cached_grid.device != x.device:
-            self._cached_grid = self.grid.to(device=x.device, dtype=x.dtype)
+        grid = self.grid.to(dtype=x.dtype) if self.grid.dtype != x.dtype else self.grid
         x_norm = torch.tanh(x).unsqueeze(-1)
-        basis = torch.relu(x_norm - self._cached_grid).square()
+        basis = torch.relu(x_norm - grid).square()
         kan_out = F.linear(basis.flatten(2), self.kan_weight)
         return base_out + kan_out
 
@@ -870,7 +883,7 @@ class FastDecoupledBlock(nn.Module):
         self.kan_ffn = GatedKANFeedForward(dim, k=k)
         self.res_scale = 1.0 / math.sqrt(2.0 * total_layers)
 
-        # Only stage boundary blocks allocate local heads. Intermediate blocks save ~51 MB VRAM each.
+        # Only stage boundary blocks allocate local heads. Intermediate blocks save >50 MB VRAM each.
         if has_head:
             self.local_head = nn.Sequential(
                 nn.LayerNorm(dim),
@@ -938,22 +951,29 @@ class LightweightEMA:
         self._param_list = [p for _, p in active_named_params]
         self._name_to_idx = {name: i for i, name in enumerate(self._names)}
 
-        # Shadow in float32 for precision (~236 MB for active params, fits safely in GDDR6).
+        # Shadow in float32 for precision
         self.shadow = [
             p.detach().to(device=self.target_device, dtype=torch.float32).clone()
             for p in self._param_list
         ]
 
     @torch.no_grad()
-    def update(self, model=None):
-        self._step_count += 1
+    def update(self, step=None):
+        if step is not None:
+            self._step_count = step
+        else:
+            self._step_count += 1
         if self._step_count % self.update_interval != 0:
             return
 
         d = self.effective_decay
         one_minus_d = 1.0 - d
 
-        if self.target_device.type == "cuda" and hasattr(torch, "_foreach_mul_") and hasattr(torch, "_foreach_add_"):
+        if (self.target_device.type == "cuda"
+                and len(self._param_list) > 0
+                and self._param_list[0].device.type == "cuda"
+                and hasattr(torch, "_foreach_mul_")
+                and hasattr(torch, "_foreach_add_")):
             torch._foreach_mul_(self.shadow, d)
             torch._foreach_add_(self.shadow, self._param_list, alpha=one_minus_d)
         else:
@@ -968,14 +988,22 @@ class LightweightEMA:
 
     @torch.no_grad()
     def copy_to(self, model=None):
-        for p, s in zip(self._param_list, self.shadow):
-            p.copy_(s.to(device=p.device, dtype=p.dtype))
+        if (hasattr(torch, "_foreach_copy_")
+                and len(self._param_list) > 0
+                and self._param_list[0].device == self.target_device):
+            torch._foreach_copy_(self._param_list, [s.to(dtype=p.dtype) for s, p in zip(self.shadow, self._param_list)])
+        else:
+            for p, s in zip(self._param_list, self.shadow):
+                p.copy_(s.to(device=p.device, dtype=p.dtype))
 
     def state_dict(self):
+        # Save in bfloat16 if hardware supports it, else float16 to prevent CUDA invalid kernel errors on Turing/Pascal GPUs
+        save_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
         return {
             "decay": self.decay,
             "update_interval": self.update_interval,
-            "shadow": {name: s.to(torch.bfloat16) for name, s in zip(self._names, self.shadow)}
+            "step_count": self._step_count,
+            "shadow": {name: s.to(save_dtype) for name, s in zip(self._names, self.shadow)}
         }
 
     def load_state_dict(self, sd):
@@ -983,6 +1011,7 @@ class LightweightEMA:
             return
         self.decay = float(sd.get("decay", self.decay))
         self.effective_decay = self.decay ** self.update_interval
+        self._step_count = int(sd.get("step_count", self._step_count))
         shadow_dict = sd.get("shadow", {})
         for name, idx in self._name_to_idx.items():
             t = shadow_dict.get(name)
@@ -1079,6 +1108,7 @@ class MacroDecoupledTrainer32k:
             cur_lr = self.base_lr * (step / float(self.warmup_steps)) if self.warmup_steps > 0 else self.base_lr
         else:
             progress = (step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+            progress = min(1.0, max(0.0, progress))
             decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             cur_lr = max(self.min_lr + (self.base_lr - self.min_lr) * decay, self.min_lr)
 
@@ -1096,7 +1126,11 @@ class MacroDecoupledTrainer32k:
         if self.ema is None:
             yield
             return
-        backup = [p.detach().to("cpu", copy=True) for p in self.ema._param_list]
+        use_cuda_backup = (self.device.type == "cuda" and self.ema.target_device.type == "cuda")
+        if use_cuda_backup:
+            backup = [p.detach().clone() for p in self.ema._param_list]
+        else:
+            backup = [p.detach().to("cpu", copy=True) for p in self.ema._param_list]
         with torch.no_grad():
             self.ema.copy_to()
         try:
@@ -1115,6 +1149,7 @@ class MacroDecoupledTrainer32k:
         optimizer_list = self.optimizers
         stage_active_params = self._stage_active_params
 
+        y_flat = y.reshape(-1)
         h = self.model.get_initial_embeddings(x)
         stage_losses = []
         scaler_enabled = self.scaler.is_enabled()
@@ -1130,19 +1165,30 @@ class MacroDecoupledTrainer32k:
                 for l in range(start, end):
                     h = blocks_fwd[l](h)
                 logits = heads_fwd[end - 1](h)
-                loss = F.cross_entropy(logits.view(-1, vocab_size), y.reshape(-1))
+                loss = F.cross_entropy(logits.view(-1, vocab_size), y_flat)
                 del logits
 
             optimizer_list[s].zero_grad(set_to_none=True)
             if scaler_enabled:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer_list[s])
-                torch.nn.utils.clip_grad_norm_(stage_active_params[s], max_norm=self.grad_clip)
+                if self.grad_clip > 0:
+                    try:
+                        torch.nn.utils.clip_grad_norm_(stage_active_params[s], max_norm=self.grad_clip, foreach=True)
+                    except Exception:
+                        torch.nn.utils.clip_grad_norm_(stage_active_params[s], max_norm=self.grad_clip)
                 scaler.step(optimizer_list[s])
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(stage_active_params[s], max_norm=self.grad_clip)
+                if self.grad_clip > 0:
+                    try:
+                        torch.nn.utils.clip_grad_norm_(stage_active_params[s], max_norm=self.grad_clip, foreach=True)
+                    except Exception:
+                        torch.nn.utils.clip_grad_norm_(stage_active_params[s], max_norm=self.grad_clip)
                 optimizer_list[s].step()
+
+            # Free stage gradients immediately to maximize free VRAM for subsequent stages
+            optimizer_list[s].zero_grad(set_to_none=True)
 
             if should_log:
                 stage_losses.append(loss.detach())
@@ -1151,7 +1197,7 @@ class MacroDecoupledTrainer32k:
             scaler.update()
 
         if self.ema is not None:
-            self.ema.update()
+            self.ema.update(step)
 
         if should_log:
             losses = torch.stack(stage_losses).tolist()
@@ -1202,16 +1248,18 @@ class MacroDecoupledTrainer32k:
         else:
             print(f"[resume] Optimizer count mismatch ({len(saved_opts)} vs {len(self.optimizers)}).")
 
+        # In PyTorch, torch.cuda.set_rng_state_all expects CPU ByteTensors.
         if checkpoint.get("cuda_rng_state") is not None and self.device.type == "cuda":
             try:
                 states = []
                 for s in checkpoint["cuda_rng_state"]:
                     if isinstance(s, torch.Tensor):
-                        s = s.detach().to(device="cuda", dtype=torch.uint8)
+                        s = s.detach().to(device="cpu", dtype=torch.uint8)
                     states.append(s)
                 torch.cuda.set_rng_state_all(states)
             except Exception as e:
                 print(f"[resume] Could not restore CUDA RNG state: {e}")
+
         if checkpoint.get("rng_state") is not None:
             rng_state = checkpoint["rng_state"]
             if isinstance(rng_state, torch.Tensor):
@@ -1220,16 +1268,22 @@ class MacroDecoupledTrainer32k:
                 torch.set_rng_state(rng_state)
             except Exception as e:
                 print(f"[resume] Could not restore torch RNG state: {e}")
+
         if checkpoint.get("python_rng_state") is not None:
             try:
                 random.setstate(checkpoint["python_rng_state"])
             except Exception:
                 pass
+
         if self.prefetcher is not None and checkpoint.get("prefetcher_rng_state") is not None:
             try:
-                self.prefetcher.set_state(checkpoint["prefetcher_rng_state"])
+                pf_state = checkpoint["prefetcher_rng_state"]
+                if isinstance(pf_state, torch.Tensor):
+                    pf_state = pf_state.detach().to(device="cpu", dtype=torch.uint8)
+                self.prefetcher.set_state(pf_state)
             except Exception:
                 pass
+
         scaler_state = checkpoint.get("scaler_state")
         if scaler_state:
             try:
@@ -1269,6 +1323,8 @@ class MacroDecoupledTrainer32k:
 # ---------------------------------------------------------------------------
 
 def perplexity(loss):
+    if math.isnan(loss) or loss == float("inf"):
+        return float("inf")
     return math.exp(min(loss, 20.0))
 
 
@@ -1291,11 +1347,12 @@ def evaluate(model, val_tokens, cfg, device, blocks_fwd=None, heads_fwd=None):
                     h = cb(h)
                 logits = heads_fwd[-1](h)
                 loss = F.cross_entropy(logits.view(-1, model.vocab_size), y.reshape(-1))
-                del logits
-            losses.append(loss.item())
+            losses.append(loss)
     finally:
         model.train(was_training)
-    return sum(losses) / max(len(losses), 1)
+    if not losses:
+        return float("inf")
+    return torch.stack(losses).mean().item()
 
 
 @torch.inference_mode()
@@ -1308,6 +1365,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, temperature, top_k, top_p
     if not tokens:
         tokens = [0]
     input_ids = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+    eot_id = tokenizer.tok.token_to_id("<|endoftext|>")
 
     try:
         for _ in range(max_new_tokens):
@@ -1342,7 +1400,11 @@ def generate(model, tokenizer, prompt, max_new_tokens, temperature, top_k, top_p
                 next_logits[0, sorted_indices[sorted_indices_to_remove]] = -float("Inf")
 
             probs = F.softmax(next_logits, dim=-1)
+            if torch.isnan(probs).any() or probs.sum() == 0:
+                break
             next_token = torch.multinomial(probs, num_samples=1)
+            if eot_id is not None and next_token.item() == eot_id:
+                break
             input_ids = torch.cat([input_ids, next_token], dim=1)
 
             new_tok_str = tokenizer.decode([next_token.item()])
@@ -1398,6 +1460,17 @@ def main():
     train_tokens, val_tokens, tokenizer, data_signature = load_data(cfg)
     print(f"[tokenizer] Effective vocabulary size: {tokenizer.vocab_size:,}")
 
+    # Pin memory for zero-copy DMA host-to-device transfers
+    if device.type == "cuda":
+        try:
+            if not train_tokens.is_pinned():
+                train_tokens = train_tokens.pin_memory()
+            if not val_tokens.is_pinned():
+                val_tokens = val_tokens.pin_memory()
+            print("[perf] Dataset buffers pinned in host RAM for zero-copy transfers.")
+        except Exception:
+            pass
+
     model = KANLanguageModel(
         vocab_size=tokenizer.vocab_size,
         dim=cfg["model"]["dim"],
@@ -1406,9 +1479,15 @@ def main():
         k=cfg["model"]["k"],
         stage_size=t["stage_size"]
     ).to(device)
-    model_config = {"vocab_size": tokenizer.vocab_size, "dim": cfg["model"]["dim"],
-                    "num_layers": cfg["model"]["num_layers"], "max_len": cfg["model"]["max_len"],
-                    "k": cfg["model"]["k"]}
+
+    model_config = {
+        "vocab_size": tokenizer.vocab_size,
+        "dim": cfg["model"]["dim"],
+        "num_layers": cfg["model"]["num_layers"],
+        "max_len": cfg["model"]["max_len"],
+        "k": cfg["model"]["k"],
+        "stage_size": t["stage_size"],
+    }
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total Parameters: {total_params:,} (~{total_params * 4 / (1024**2):.2f} MB fp32)")
@@ -1442,10 +1521,17 @@ def main():
             saved_step = ckpt.get("step", 0)
             ckpt_sig = ckpt.get("data_signature", "")
             ckpt_cfg = ckpt.get("model_config", {})
-            if ckpt_cfg and ckpt_cfg != model_config:
+
+            mismatch = False
+            for k_cfg, v_cfg in model_config.items():
+                if k_cfg in ckpt_cfg and ckpt_cfg[k_cfg] != v_cfg:
+                    mismatch = True
+                    break
+            if mismatch:
                 raise SystemExit(
                     f"[config-mismatch] Checkpoint was trained with model_config={ckpt_cfg}, "
                     f"but current config gives {model_config}. Align config.json (or use --fresh).")
+
             start_step = saved_step + 1
             tokens_seen = ckpt.get("tokens_seen", 0)
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
@@ -1504,15 +1590,23 @@ def main():
                     last_saved_checkpoint_step = last_completed_step
                 except Exception as e:
                     print(f"[checkpoint] Could not save latest.pt during shutdown: {e}")
-            if not best_path.exists():
+
+            if eval_interval == 0 and best_improved_since_save:
+                try:
+                    with trainer.ema_weights():
+                        trainer.save_checkpoint(best_path, last_completed_step, best_loss, best_val_loss,
+                                                data_signature, tokens_seen, model_config)
+                except Exception as e:
+                    print(f"[checkpoint] Could not save best.pt during shutdown: {e}")
+            elif not best_path.exists():
                 print("[checkpoint] No best checkpoint yet; running one evaluation to create one.")
                 try:
                     with trainer.ema_weights():
                         v_loss = evaluate(model, val_tokens, cfg, device,
                                           trainer.blocks_fwd, trainer.heads_fwd)
-                    best_val_loss = min(best_val_loss, v_loss)
-                    trainer.save_checkpoint(best_path, last_completed_step, best_loss, best_val_loss,
-                                            data_signature, tokens_seen, model_config)
+                        best_val_loss = min(best_val_loss, v_loss)
+                        trainer.save_checkpoint(best_path, last_completed_step, best_loss, best_val_loss,
+                                                data_signature, tokens_seen, model_config)
                 except Exception as e:
                     print(f"[checkpoint] Could not save best.pt during shutdown: {e}")
 
@@ -1535,6 +1629,7 @@ def main():
                     if device.type == "cuda" and is_cuda_oom_error(e):
                         print(f"[oom] CUDA out of memory at step {step}; discarding this batch.")
                         trainer._zero_all_grads()
+                        torch.cuda.empty_cache()
                         continue
                     raise
 
@@ -1548,8 +1643,9 @@ def main():
                     val_ppl = perplexity(val_loss)
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        trainer.save_checkpoint(best_path, step, best_loss, best_val_loss,
-                                                data_signature, tokens_seen, model_config)
+                        with trainer.ema_weights():
+                            trainer.save_checkpoint(best_path, step, best_loss, best_val_loss,
+                                                    data_signature, tokens_seen, model_config)
 
                 if capture_loss and final_loss < best_loss:
                     best_loss = final_loss
@@ -1560,8 +1656,9 @@ def main():
                                             data_signature, tokens_seen, model_config)
                     last_saved_checkpoint_step = step
                     if eval_interval == 0 and best_improved_since_save:
-                        trainer.save_checkpoint(best_path, step, best_loss, best_val_loss,
-                                                data_signature, tokens_seen, model_config)
+                        with trainer.ema_weights():
+                            trainer.save_checkpoint(best_path, step, best_loss, best_val_loss,
+                                                    data_signature, tokens_seen, model_config)
                         best_improved_since_save = False
 
                 if should_log:
