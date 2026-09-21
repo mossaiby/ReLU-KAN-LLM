@@ -1,33 +1,33 @@
 {
   "model": {
-    "dim": 384,
-    "num_layers": 8,
-    "max_len": 256,
+    "dim": 512,
+    "num_layers": 12,
+    "max_len": 512,
     "k": 6
   },
   "data": {
     "type": "hf",
     "path": "",
-    "hf_name": "HuggingFaceFW/fineweb-edu",
-    "hf_config": "sample-10BT",
-    "max_articles": 130000,
+    "hf_name": "HuggingFaceTB/cosmopedia-100k",
+    "hf_config": "default",
     "hf_split": "train",
     "hf_revision": "",
     "text_column": "text",
     "data_dir": "./data",
     "tokenizer_vocab_size": 32768,
     "val_fraction": 0.01,
+    "max_articles": 100000,
     "append_eot": true,
     "seed": 1337
   },
   "training": {
     "batch_size": 16,
-    "steps": 25000,
-    "lr": 0.00025,
-    "min_lr": 2e-05,
-    "warmup_steps": 250,
+    "steps": 50000,
+    "lr": 3e-05,
+    "min_lr": 3e-05,
+    "warmup_steps": 500,
     "weight_decay": 0.0001,
-    "stage_size": 4,
+    "stage_size": 6,
     "grad_clip": 1.0,
     "log_interval": 50,
     "eval_interval": 0,
@@ -45,11 +45,11 @@
     "ema_device": "cuda"
   },
   "generation": {
-    "max_new_tokens": 70,
+    "max_new_tokens": 100,
     "temperature": 0.68,
     "top_k": 40,
     "top_p": 0.9,
-    "repetition_penalty": 1.2,
+    "repetition_penalty": 1.22,
     "prompts": [
       "Photosynthesis is the process by which",
       "The solar system consists of",
@@ -58,7 +58,7 @@
   },
   "io": {
     "checkpoint_dir": "./checkpoints",
-    "checkpoint_name": "kan_model",
+    "checkpoint_name": "kan_model_120m_cosmo",
     "config_path": "config.json"
   }
 }
